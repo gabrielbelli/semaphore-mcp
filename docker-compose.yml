@@ -1,0 +1,9 @@
+services:
+  semaphore-mcp:
+    build: .
+    image: semaphore-mcp:latest
+    stdin_open: true
+    tty: false
+    environment:
+      SEMAPHORE_URL: ${SEMAPHORE_URL:?set SEMAPHORE_URL}
+      SEMAPHORE_TOKEN: ${SEMAPHORE_TOKEN:?set SEMAPHORE_TOKEN}

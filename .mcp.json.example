@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "semaphore": {
+      "command": "docker",
+      "args": [
+        "run", "--rm", "-i",
+        "-e", "SEMAPHORE_URL=https://semaphore.example.com",
+        "-e", "SEMAPHORE_TOKEN=REPLACE_WITH_SCOPED_TOKEN",
+        "ghcr.io/gabrielbelli/semaphore-mcp:latest"
+      ]
+    }
+  }
+}
