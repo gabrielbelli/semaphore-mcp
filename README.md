@@ -13,28 +13,35 @@ The token never passes through Claude's context — it's an environment variable
 
 Semaphore's API is **127 operations** and ships **empty `operationId`s**, so a generic OpenAPI→MCP bridge produces unusable tool names.
 
-`generate.py` solves that: it reads the pinned `api-docs.yml`, filters to a hand-picked **allowlist**, synthesises clean tool names, and derives `readOnlyHint` / `destructiveHint` annotations from each tool's declared tier. The result is **23 tools across three tiers**:
+`generate.py` solves that: it reads the pinned `api-docs.yml`, filters to a hand-picked **allowlist**, synthesises clean tool names, and derives `readOnlyHint` / `destructiveHint` annotations from each tool's declared tier. The result is **27 tools across three tiers**:
 
 | Tier | Count | `readOnlyHint` | `destructiveHint` | Guard |
 |---|---|---|---|---|
-| **read** | 11 | `True` | `False` | safe to auto-allow |
-| **write** | 8 | `False` | `False` | `ask` — state-changing, non-destructive |
-| **delete** | 4 | `False` | `True` | `ask` **+** refuses unless `confirm=True` |
+| **read** | 12 | `True` | `False` | safe to auto-allow |
+| **write** | 10 | `False` | `False` | `ask` — state-changing, non-destructive |
+| **delete** | 5 | `False` | `True` | `ask` **+** refuses unless `confirm=True` |
+
+Covered resources: projects, templates, tasks, inventories, environments (vars), and **repositories** (create/update/delete — needed for branch-pinned testing).
 
 ```
 GET    /project/{id}/templates              -> list_templates      (read)
-GET    /project/{id}/tasks/{tid}/output     -> get_task_output     (read)
+GET    /project/{id}/repositories           -> list_repositories   (read)
 ...
 POST   /project/{id}/tasks                  -> run_task            (write)
 POST   /project/{id}/templates              -> create_template     (write)
 PUT    /project/{id}/environment/{eid}      -> update_environment  (write — set vars)
-POST   /project/{id}/inventory              -> create_inventory    (write)
+POST   /project/{id}/repositories           -> create_repository   (write — pin a branch)
 ...
 DELETE /project/{id}/templates/{tid}        -> delete_template     (delete, guarded)
 DELETE /project/{id}/tasks/{tid}            -> delete_task         (delete, guarded)
 ```
 
-Each `delete_*` tool **refuses on the first call** — it returns a refusal payload unless invoked with `confirm=True`, so a stray delete can never fire by accident. Widen or narrow the surface by editing the `ALLOWLIST` in `generate.py` and regenerating.
+Two safety properties worth calling out:
+
+- **Deletes refuse on the first call.** Every `delete_*` returns a refusal payload unless invoked with `confirm=True`, so a stray delete can never fire by accident.
+- **Updates never blank what you didn't touch.** `update_*` tools are read-modify-write: they `GET` the current object, overlay only the fields you pass, then `PUT` the merged result — so renaming a template can't silently wipe its arguments or survey vars. (Environment secrets are write-only in the API and are never echoed back; omitting them leaves stored secrets intact.)
+
+Widen or narrow the surface by editing the `ALLOWLIST` in `generate.py` and regenerating.
 
 ---
 
@@ -90,17 +97,19 @@ Belt-and-braces permission block for Claude Code `settings.json` — reads run s
       "mcp__semaphore__list_tasks", "mcp__semaphore__get_last_tasks",
       "mcp__semaphore__get_task", "mcp__semaphore__get_task_output",
       "mcp__semaphore__list_inventory", "mcp__semaphore__get_inventory",
-      "mcp__semaphore__list_environment"
+      "mcp__semaphore__list_environment", "mcp__semaphore__list_repositories"
     ],
     "ask": [
       "mcp__semaphore__run_task", "mcp__semaphore__stop_task",
       "mcp__semaphore__create_template", "mcp__semaphore__update_template",
       "mcp__semaphore__create_environment", "mcp__semaphore__update_environment",
-      "mcp__semaphore__create_inventory", "mcp__semaphore__update_inventory"
+      "mcp__semaphore__create_inventory", "mcp__semaphore__update_inventory",
+      "mcp__semaphore__create_repository", "mcp__semaphore__update_repository"
     ],
     "deny": [
       "mcp__semaphore__delete_template", "mcp__semaphore__delete_environment",
-      "mcp__semaphore__delete_inventory", "mcp__semaphore__delete_task"
+      "mcp__semaphore__delete_inventory", "mcp__semaphore__delete_repository",
+      "mcp__semaphore__delete_task"
     ]
   }
 }

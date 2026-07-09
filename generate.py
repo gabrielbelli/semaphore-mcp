@@ -44,6 +44,7 @@ ALLOWLIST = [
     dict(name="list_inventory",   method="GET", path="/project/{project_id}/inventory",                kind="read"),
     dict(name="get_inventory",    method="GET", path="/project/{project_id}/inventory/{inventory_id}", kind="read"),
     dict(name="list_environment", method="GET", path="/project/{project_id}/environment",              kind="read"),
+    dict(name="list_repositories",method="GET", path="/project/{project_id}/repositories",             kind="read"),
 
     # --- writes (state-changing, non-destructive) ----------------------------
     dict(name="run_task",  method="POST", path="/project/{project_id}/tasks", kind="write", body=[
@@ -63,15 +64,20 @@ ALLOWLIST = [
         ("git_branch",    "git_branch",    "Optional[str]", "None"),
         ("description",   "description",   "Optional[str]", "None"),
     ]),
-    dict(name="update_template", method="PUT", path="/project/{project_id}/templates/{template_id}", kind="write", body=[
-        ("name",          "name",          "str", REQ),
-        ("playbook",      "playbook",      "str", REQ),
-        ("inventory_id",  "inventory_id",  "int", REQ),
-        ("repository_id", "repository_id", "int", REQ),
-        ("environment_id","environment_id","int", REQ),
-        ("app",           "app",           "str", '"ansible"'),
-        ("git_branch",    "git_branch",    "Optional[str]", "None"),
-        ("description",   "description",   "Optional[str]", "None"),
+    # update_* are read-modify-write (update=True): fields default None and only
+    # the ones you pass overlay the fetched object, so omitting a field preserves
+    # it instead of blanking it.
+    dict(name="update_template", method="PUT", path="/project/{project_id}/templates/{template_id}", kind="write", update=True, body=[
+        ("name",                       "name",                       "Optional[str]", "None"),
+        ("playbook",                   "playbook",                   "Optional[str]", "None"),
+        ("inventory_id",               "inventory_id",               "Optional[int]", "None"),
+        ("repository_id",              "repository_id",              "Optional[int]", "None"),
+        ("environment_id",             "environment_id",             "Optional[int]", "None"),
+        ("app",                        "app",                        "Optional[str]", "None"),
+        ("git_branch",                 "git_branch",                 "Optional[str]", "None"),
+        ("description",                "description",                "Optional[str]", "None"),
+        ("arguments",                  "arguments",                  "Optional[str]", "None"),   # JSON array string
+        ("allow_override_args_in_task","allow_override_args_in_task","Optional[bool]", "None"),
     ]),
 
     dict(name="create_environment", method="POST", path="/project/{project_id}/environment", kind="write", body=[
@@ -80,10 +86,12 @@ ALLOWLIST = [
         ("env_vars", "env",      "str", '"{}"'),  # environment vars, JSON string
         ("password", "password", "Optional[str]", "None"),
     ]),
-    dict(name="update_environment", method="PUT", path="/project/{project_id}/environment/{environment_id}", kind="write", body=[
-        ("name",     "name",     "str", REQ),
-        ("json_vars","json",     "str", '"{}"'),
-        ("env_vars", "env",      "str", '"{}"'),
+    # strip `secrets`: the API returns secret metadata without values, so echoing
+    # it back on PUT is meaningless; omitting it leaves stored secrets intact.
+    dict(name="update_environment", method="PUT", path="/project/{project_id}/environment/{environment_id}", kind="write", update=True, strip=["secrets"], body=[
+        ("name",     "name",     "Optional[str]", "None"),
+        ("json_vars","json",     "Optional[str]", "None"),
+        ("env_vars", "env",      "Optional[str]", "None"),
         ("password", "password", "Optional[str]", "None"),
     ]),
 
@@ -95,19 +103,35 @@ ALLOWLIST = [
         ("become_key_id","become_key_id","Optional[int]", "None"),
         ("repository_id","repository_id","Optional[int]", "None"),
     ]),
-    dict(name="update_inventory", method="PUT", path="/project/{project_id}/inventory/{inventory_id}", kind="write", body=[
-        ("name",         "name",         "str", REQ),
-        ("inventory",    "inventory",    "str", REQ),
-        ("type",         "type",         "str", '"static"'),
+    dict(name="update_inventory", method="PUT", path="/project/{project_id}/inventory/{inventory_id}", kind="write", update=True, body=[
+        ("name",         "name",         "Optional[str]", "None"),
+        ("inventory",    "inventory",    "Optional[str]", "None"),
+        ("type",         "type",         "Optional[str]", "None"),
         ("ssh_key_id",   "ssh_key_id",   "Optional[int]", "None"),
         ("become_key_id","become_key_id","Optional[int]", "None"),
         ("repository_id","repository_id","Optional[int]", "None"),
+    ]),
+
+    # repositories: branch is pinned at the repo level, so branch testing needs a
+    # dedicated repo object -> full CRUD.
+    dict(name="create_repository", method="POST", path="/project/{project_id}/repositories", kind="write", body=[
+        ("name",       "name",       "str", REQ),
+        ("git_url",    "git_url",    "str", REQ),
+        ("git_branch", "git_branch", "str", '"main"'),
+        ("ssh_key_id", "ssh_key_id", "int", REQ),
+    ]),
+    dict(name="update_repository", method="PUT", path="/project/{project_id}/repositories/{repository_id}", kind="write", update=True, body=[
+        ("name",       "name",       "Optional[str]", "None"),
+        ("git_url",    "git_url",    "Optional[str]", "None"),
+        ("git_branch", "git_branch", "Optional[str]", "None"),
+        ("ssh_key_id", "ssh_key_id", "Optional[int]", "None"),
     ]),
 
     # --- deletes (destructive, in-server confirm gate) -----------------------
     dict(name="delete_template",    method="DELETE", path="/project/{project_id}/templates/{template_id}",   kind="delete"),
     dict(name="delete_environment", method="DELETE", path="/project/{project_id}/environment/{environment_id}", kind="delete"),
     dict(name="delete_inventory",   method="DELETE", path="/project/{project_id}/inventory/{inventory_id}", kind="delete"),
+    dict(name="delete_repository",  method="DELETE", path="/project/{project_id}/repositories/{repository_id}", kind="delete"),
     dict(name="delete_task",        method="DELETE", path="/project/{project_id}/tasks/{task_id}",           kind="delete"),
 ]
 
@@ -118,6 +142,11 @@ Three tiers, guardrailed — NOT read-only:
   read   -> safe to auto-allow
   write  -> create/update/run; state-changing but non-destructive
   delete -> destructive; refuses unless called with confirm=True
+
+update_* tools read-modify-write: they GET the current object, overlay only the
+fields you pass, then PUT the merged result — so a rename can't blank the fields
+you left out. (Environment secrets are write-only in the API, so they are never
+echoed back; omitting them leaves stored secrets untouched.)
 
 Env:
   SEMAPHORE_URL    e.g. https://semaphore.example.com
@@ -146,6 +175,10 @@ async def _request(method, path, query=None, body=None):
     async with httpx.AsyncClient(timeout=30) as c:
         r = await c.request(method, url, headers=headers, params=query, json=body)
         r.raise_for_status()
+        # Semaphore answers PUT/DELETE with 204 No Content (empty body). Parsing
+        # that as JSON blows up ("Expecting value"), so report the success it is.
+        if r.status_code == 204 or not r.content:
+            return {"ok": True}
         ct = r.headers.get("content-type", "")
         return r.json() if "json" in ct else r.text
 '''
@@ -177,25 +210,15 @@ def emit_tool(entry):
     if kind == "delete":
         args += ["confirm: bool = False"]
 
-    # --- request wiring
-    query_expr = "None"
-    body_expr = "None"
-    body_lines = []
-    if kind == "read" and name.startswith("list_"):
-        query_expr = '{"sort": sort, "order": order}'
-    if body_fields or (kind == "write" and pp):
-        # inject project_id and any trailing {*_id} (mapped to json key "id")
-        inject = []
-        for p in pp:
-            if p == "project_id":
-                inject.append('"project_id": project_id')
-            elif p.endswith("_id"):
-                inject.append(f'"id": {p}')
-        pairs = inject + [f'"{k}": {a}' for a, k, t in required] \
-                       + [f'"{k}": {a}' for a, k, t, d in optional]
-        body_lines.append("    body = {" + ", ".join(pairs) + "}")
-        body_lines.append("    body = {k: v for k, v in body.items() if v is not None}")
-        body_expr = "body"
+    # id injections shared by write bodies: project_id + any trailing {*_id}->"id"
+    inject = []
+    id_param = None
+    for p in pp:
+        if p == "project_id":
+            inject.append('"project_id": project_id')
+        elif p.endswith("_id"):
+            inject.append(f'"id": {p}')
+            id_param = p
 
     doc = f"{method} {path}"
     lines = [
@@ -203,13 +226,44 @@ def emit_tool(entry):
         f"async def {name}({', '.join(args)}) -> str:",
         f'    """{doc}"""',
     ]
+
     if kind == "delete":
         lines.append('    if not confirm:')
         lines.append('        return json.dumps({"error": "destructive operation refused", '
                      f'"tool": {name!r}, "hint": "re-invoke with confirm=true to proceed"}}, indent=2)')
-    lines += body_lines
-    lines.append(f'    res = await _request("{method}", f"{path}", '
-                 f'query={query_expr}, body={body_expr})')
+
+    if entry.get("update"):
+        # read-modify-write: fetch current, overlay only the fields supplied,
+        # re-assert ids, drop write-only echoes, then PUT the merged object.
+        strip = entry.get("strip", [])
+        updates = ", ".join(f'"{k}": {a}' for a, k, t, d in optional)
+        lines.append(f'    current = await _request("GET", f"{path}", query=None, body=None)')
+        lines.append('    if not isinstance(current, dict) or current.get("error"):')
+        lines.append('        return json.dumps(current, indent=2, default=str)')
+        lines.append("    updates = {" + updates + "}")
+        lines.append("    body = {**current, **{k: v for k, v in updates.items() if v is not None}}")
+        for p in pp:
+            if p == "project_id":
+                lines.append('    body["project_id"] = project_id')
+            elif p.endswith("_id"):
+                lines.append(f'    body["id"] = {p}')
+        for s in strip:
+            lines.append(f'    body.pop({s!r}, None)')
+        lines.append(f'    res = await _request("{method}", f"{path}", query=None, body=body)')
+    else:
+        query_expr = "None"
+        body_expr = "None"
+        if kind == "read" and name.startswith("list_"):
+            query_expr = '{"sort": sort, "order": order}'
+        if body_fields or (kind == "write" and pp):
+            pairs = inject + [f'"{k}": {a}' for a, k, t in required] \
+                           + [f'"{k}": {a}' for a, k, t, d in optional]
+            lines.append("    body = {" + ", ".join(pairs) + "}")
+            lines.append("    body = {k: v for k, v in body.items() if v is not None}")
+            body_expr = "body"
+        lines.append(f'    res = await _request("{method}", f"{path}", '
+                     f'query={query_expr}, body={body_expr})')
+
     lines.append("    return json.dumps(res, indent=2, default=str)")
     return "\n".join(lines)
 
