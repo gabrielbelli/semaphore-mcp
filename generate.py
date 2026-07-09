@@ -4,9 +4,17 @@
 Why a generator and not a generic bridge:
   * Semaphore's spec ships EMPTY operationIds -> a naive bridge emits unusable
     tool names. We synthesise clean names here.
-  * The raw spec is 127 operations, 38 destructive. We expose a curated ~13.
-  * Annotations (readOnlyHint / destructiveHint) are derived from the HTTP verb
-    and the tool's declared `kind`, so hints are honest and automatic.
+  * The raw spec is 127 operations. We expose a curated ~23 across three tiers.
+  * Annotations (readOnlyHint / destructiveHint) are derived from the tool's
+    declared `kind`, so hints are honest and automatic.
+
+Safety model (three tiers, NOT read-only):
+  * "read"   -> readOnlyHint=True                       (silent-allow candidate)
+  * "write"  -> state-changing, NOT destructive         (ask candidate)
+                create/update templates, environments (vars), inventories; run.
+  * "delete" -> destructiveHint=True + in-server guard  (double-gated)
+                the tool REFUSES unless called with confirm=True, so a stray
+                delete can never fire on the first shot.
 
 Run:  python generate.py  ->  writes server.py
 """
@@ -16,38 +24,110 @@ import yaml
 SPEC = "api-docs.yml"
 OUT = "server.py"
 
-# --- Curated allowlist: (tool_name, METHOD, path_template, kind) -------------
-# kind drives annotations + whether it lands in deny/ask/allow buckets.
-#   "read"  -> readOnlyHint=True                     (silent-allow candidate)
-#   "run"   -> state-changing, NOT destructive       (ask candidate)
-# Destructive ops (DELETE/PUT) are deliberately ABSENT: they are never emitted.
+REQ = None  # sentinel: a body field with default REQ has no default in the signature
+
+# --- Curated allowlist --------------------------------------------------------
+# Each entry: dict(name, method, path, kind[, body]).
+#   body: list of (arg_name, json_key, annotation, default_src)
+#         default_src is a literal string emitted after "=", or REQ for required.
+# project_id (and any trailing {*_id}) is injected into write bodies automatically.
 ALLOWLIST = [
-    ("list_projects",    "GET",  "/projects",                                     "read"),
-    ("get_project",      "GET",  "/project/{project_id}/",                        "read"),
-    ("list_templates",   "GET",  "/project/{project_id}/templates",               "read"),
-    ("get_template",     "GET",  "/project/{project_id}/templates/{template_id}", "read"),
-    ("list_tasks",       "GET",  "/project/{project_id}/tasks",                   "read"),
-    ("get_last_tasks",   "GET",  "/project/{project_id}/tasks/last",              "read"),
-    ("get_task",         "GET",  "/project/{project_id}/tasks/{task_id}",         "read"),
-    ("get_task_output",  "GET",  "/project/{project_id}/tasks/{task_id}/output",  "read"),
-    ("list_inventory",   "GET",  "/project/{project_id}/inventory",               "read"),
-    ("get_inventory",    "GET",  "/project/{project_id}/inventory/{inventory_id}","read"),
-    ("list_environment", "GET",  "/project/{project_id}/environment",             "read"),
-    ("run_task",         "POST", "/project/{project_id}/tasks",                   "run"),
-    ("stop_task",        "POST", "/project/{project_id}/tasks/{task_id}/stop",    "run"),
+    # --- reads ---------------------------------------------------------------
+    dict(name="list_projects",    method="GET", path="/projects",                                      kind="read"),
+    dict(name="get_project",      method="GET", path="/project/{project_id}/",                         kind="read"),
+    dict(name="list_templates",   method="GET", path="/project/{project_id}/templates",                kind="read"),
+    dict(name="get_template",     method="GET", path="/project/{project_id}/templates/{template_id}",  kind="read"),
+    dict(name="list_tasks",       method="GET", path="/project/{project_id}/tasks",                    kind="read"),
+    dict(name="get_last_tasks",   method="GET", path="/project/{project_id}/tasks/last",               kind="read"),
+    dict(name="get_task",         method="GET", path="/project/{project_id}/tasks/{task_id}",          kind="read"),
+    dict(name="get_task_output",  method="GET", path="/project/{project_id}/tasks/{task_id}/output",   kind="read"),
+    dict(name="list_inventory",   method="GET", path="/project/{project_id}/inventory",                kind="read"),
+    dict(name="get_inventory",    method="GET", path="/project/{project_id}/inventory/{inventory_id}", kind="read"),
+    dict(name="list_environment", method="GET", path="/project/{project_id}/environment",              kind="read"),
+
+    # --- writes (state-changing, non-destructive) ----------------------------
+    dict(name="run_task",  method="POST", path="/project/{project_id}/tasks", kind="write", body=[
+        ("template_id", "template_id", "int", REQ),
+        ("environment", "environment", "str", '""'),
+        ("limit",       "limit",       "str", '""'),
+    ]),
+    dict(name="stop_task", method="POST", path="/project/{project_id}/tasks/{task_id}/stop", kind="write"),
+
+    dict(name="create_template", method="POST", path="/project/{project_id}/templates", kind="write", body=[
+        ("name",          "name",          "str", REQ),
+        ("playbook",      "playbook",      "str", REQ),
+        ("inventory_id",  "inventory_id",  "int", REQ),
+        ("repository_id", "repository_id", "int", REQ),
+        ("environment_id","environment_id","int", REQ),
+        ("app",           "app",           "str", '"ansible"'),
+        ("git_branch",    "git_branch",    "Optional[str]", "None"),
+        ("description",   "description",   "Optional[str]", "None"),
+    ]),
+    dict(name="update_template", method="PUT", path="/project/{project_id}/templates/{template_id}", kind="write", body=[
+        ("name",          "name",          "str", REQ),
+        ("playbook",      "playbook",      "str", REQ),
+        ("inventory_id",  "inventory_id",  "int", REQ),
+        ("repository_id", "repository_id", "int", REQ),
+        ("environment_id","environment_id","int", REQ),
+        ("app",           "app",           "str", '"ansible"'),
+        ("git_branch",    "git_branch",    "Optional[str]", "None"),
+        ("description",   "description",   "Optional[str]", "None"),
+    ]),
+
+    dict(name="create_environment", method="POST", path="/project/{project_id}/environment", kind="write", body=[
+        ("name",     "name",     "str", REQ),
+        ("json_vars","json",     "str", '"{}"'),  # extra CLI vars, JSON string
+        ("env_vars", "env",      "str", '"{}"'),  # environment vars, JSON string
+        ("password", "password", "Optional[str]", "None"),
+    ]),
+    dict(name="update_environment", method="PUT", path="/project/{project_id}/environment/{environment_id}", kind="write", body=[
+        ("name",     "name",     "str", REQ),
+        ("json_vars","json",     "str", '"{}"'),
+        ("env_vars", "env",      "str", '"{}"'),
+        ("password", "password", "Optional[str]", "None"),
+    ]),
+
+    dict(name="create_inventory", method="POST", path="/project/{project_id}/inventory", kind="write", body=[
+        ("name",         "name",         "str", REQ),
+        ("inventory",    "inventory",    "str", REQ),
+        ("type",         "type",         "str", '"static"'),
+        ("ssh_key_id",   "ssh_key_id",   "Optional[int]", "None"),
+        ("become_key_id","become_key_id","Optional[int]", "None"),
+        ("repository_id","repository_id","Optional[int]", "None"),
+    ]),
+    dict(name="update_inventory", method="PUT", path="/project/{project_id}/inventory/{inventory_id}", kind="write", body=[
+        ("name",         "name",         "str", REQ),
+        ("inventory",    "inventory",    "str", REQ),
+        ("type",         "type",         "str", '"static"'),
+        ("ssh_key_id",   "ssh_key_id",   "Optional[int]", "None"),
+        ("become_key_id","become_key_id","Optional[int]", "None"),
+        ("repository_id","repository_id","Optional[int]", "None"),
+    ]),
+
+    # --- deletes (destructive, in-server confirm gate) -----------------------
+    dict(name="delete_template",    method="DELETE", path="/project/{project_id}/templates/{template_id}",   kind="delete"),
+    dict(name="delete_environment", method="DELETE", path="/project/{project_id}/environment/{environment_id}", kind="delete"),
+    dict(name="delete_inventory",   method="DELETE", path="/project/{project_id}/inventory/{inventory_id}", kind="delete"),
+    dict(name="delete_task",        method="DELETE", path="/project/{project_id}/tasks/{task_id}",           kind="delete"),
 ]
 
 HEADER = '''#!/usr/bin/env python3
 """Semaphore MCP server (POC) - GENERATED by generate.py. Do not edit by hand.
 
+Three tiers, guardrailed — NOT read-only:
+  read   -> safe to auto-allow
+  write  -> create/update/run; state-changing but non-destructive
+  delete -> destructive; refuses unless called with confirm=True
+
 Env:
   SEMAPHORE_URL    e.g. https://semaphore.example.com
-  SEMAPHORE_TOKEN  bearer API token (scope this to a read+run RBAC user)
+  SEMAPHORE_TOKEN  bearer API token (scope RBAC to match the tier you allow)
 """
 import os
 import sys
 import json
 import asyncio
+from typing import Optional
 import httpx
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
@@ -75,43 +155,60 @@ def path_params(path):
     return re.findall(r"{(\w+)}", path)
 
 
-def emit_tool(name, method, path, kind):
+def emit_tool(entry):
+    name, method, path, kind = entry["name"], entry["method"], entry["path"], entry["kind"]
     pp = path_params(path)
-    read_only = kind == "read"
-    # annotations derived from verb + kind (the honest-hints part of the POC)
-    ann = (f'ToolAnnotations(title={name!r}, readOnlyHint={read_only}, '
-           f'destructiveHint=False, idempotentHint={read_only}, openWorldHint=False)')
+    body_fields = entry.get("body", [])
 
+    read_only = kind == "read"
+    destructive = kind == "delete"
+    idempotent = kind in ("read", "delete")
+    ann = (f'ToolAnnotations(title={name!r}, readOnlyHint={read_only}, '
+           f'destructiveHint={destructive}, idempotentHint={idempotent}, openWorldHint=False)')
+
+    # --- signature: path params (required ints), then body fields, then extras
     args = [f"{p}: int" for p in pp]
+    required = [(a, k, t) for a, k, t, d in body_fields if d is REQ]
+    optional = [(a, k, t, d) for a, k, t, d in body_fields if d is not REQ]
+    args += [f"{a}: {t}" for a, k, t in required]
+    args += [f"{a}: {t} = {d}" for a, k, t, d in optional]
     if kind == "read" and name.startswith("list_"):
         args += ['sort: str = "name"', 'order: str = "asc"']
-    if name == "run_task":
-        args += ["template_id: int", 'environment: str = ""', 'limit: str = ""']
+    if kind == "delete":
+        args += ["confirm: bool = False"]
 
-    sig = ", ".join(args)
-    # build the runtime f-string path with params substituted
-    runtime_path = path
-    for p in pp:
-        runtime_path = runtime_path.replace("{" + p + "}", "{" + p + "}")
-
-    body_lines = []
+    # --- request wiring
     query_expr = "None"
     body_expr = "None"
+    body_lines = []
     if kind == "read" and name.startswith("list_"):
         query_expr = '{"sort": sort, "order": order}'
-    if name == "run_task":
-        body_lines.append('    body = {"template_id": template_id, "project_id": project_id, '
-                          '"environment": environment, "limit": limit}')
+    if body_fields or (kind == "write" and pp):
+        # inject project_id and any trailing {*_id} (mapped to json key "id")
+        inject = []
+        for p in pp:
+            if p == "project_id":
+                inject.append('"project_id": project_id')
+            elif p.endswith("_id"):
+                inject.append(f'"id": {p}')
+        pairs = inject + [f'"{k}": {a}' for a, k, t in required] \
+                       + [f'"{k}": {a}' for a, k, t, d in optional]
+        body_lines.append("    body = {" + ", ".join(pairs) + "}")
+        body_lines.append("    body = {k: v for k, v in body.items() if v is not None}")
         body_expr = "body"
 
     doc = f"{method} {path}"
     lines = [
         f"@mcp.tool(annotations={ann})",
-        f"async def {name}({sig}) -> str:",
+        f"async def {name}({', '.join(args)}) -> str:",
         f'    """{doc}"""',
     ]
+    if kind == "delete":
+        lines.append('    if not confirm:')
+        lines.append('        return json.dumps({"error": "destructive operation refused", '
+                     f'"tool": {name!r}, "hint": "re-invoke with confirm=true to proceed"}}, indent=2)')
     lines += body_lines
-    lines.append(f'    res = await _request("{method}", f"{runtime_path}", '
+    lines.append(f'    res = await _request("{method}", f"{path}", '
                  f'query={query_expr}, body={body_expr})')
     lines.append("    return json.dumps(res, indent=2, default=str)")
     return "\n".join(lines)
@@ -122,13 +219,14 @@ def main():
     known = {(m.upper(), p) for p, item in spec["paths"].items()
              for m in item if m in ("get", "post", "put", "delete")}
     out = [HEADER]
-    emitted = 0
-    for name, method, path, kind in ALLOWLIST:
-        assert (method, path) in known, f"{method} {path} not in spec!"
-        out.append("\n\n" + emit_tool(name, method, path, kind))
-        emitted += 1
+    tiers = {"read": 0, "write": 0, "delete": 0}
+    for entry in ALLOWLIST:
+        key = (entry["method"], entry["path"])
+        assert key in known, f"{entry['method']} {entry['path']} not in spec!"
+        out.append("\n\n" + emit_tool(entry))
+        tiers[entry["kind"]] += 1
 
-    footer = '''
+    footer = f'''
 
 
 def _list():
@@ -136,8 +234,10 @@ def _list():
     for t in tools:
         a = t.annotations
         ro = getattr(a, "readOnlyHint", None) if a else None
-        print(f"{t.name:18} readOnly={ro}  desc={t.description}")
-    print(f"\\n{len(tools)} tools exposed (spec has 127 operations; 38 destructive omitted)")
+        de = getattr(a, "destructiveHint", None) if a else None
+        print(f"{{t.name:20}} readOnly={{ro}} destructive={{de}}  {{t.description}}")
+    print(f"\\n{{len(tools)}} tools exposed "
+          "({tiers['read']} read / {tiers['write']} write / {tiers['delete']} delete-guarded)")
 
 
 if __name__ == "__main__":
@@ -148,7 +248,10 @@ if __name__ == "__main__":
 '''
     out.append(footer)
     open(OUT, "w").write("".join(out))
-    print(f"wrote {OUT}: {emitted} curated tools from {len(known)} spec operations")
+    total = sum(tiers.values())
+    print(f"wrote {OUT}: {total} curated tools "
+          f"({tiers['read']} read / {tiers['write']} write / {tiers['delete']} delete-guarded) "
+          f"from {len(known)} spec operations")
 
 
 if __name__ == "__main__":

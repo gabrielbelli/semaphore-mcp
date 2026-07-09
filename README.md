@@ -3,30 +3,38 @@
 [![CI](https://github.com/gabrielbelli/semaphore-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/gabrielbelli/semaphore-mcp/actions/workflows/ci.yml)
 [![ghcr.io](https://img.shields.io/badge/ghcr.io-gabrielbelli%2Fsemaphore--mcp-blue)](https://github.com/gabrielbelli/semaphore-mcp/pkgs/container/semaphore-mcp)
 
-A curated [MCP](https://modelcontextprotocol.io) server for [Semaphore UI](https://semaphoreui.com) — drive your Ansible / Terraform automation from Claude with a **safe, read-first** tool surface.
+A curated [MCP](https://modelcontextprotocol.io) server for [Semaphore UI](https://semaphoreui.com) — drive your Ansible / Terraform automation from Claude with a **safe, tiered** tool surface: read freely, write deliberately, delete only with an explicit confirmation.
 
-The token never passes through Claude's context — it's an environment variable on your machine. The exposed tool set is generated from Semaphore's own OpenAPI spec and deliberately **omits every destructive operation**.
+The token never passes through Claude's context — it's an environment variable on your machine. The exposed tool set is generated from Semaphore's own OpenAPI spec and **guardrails deletes** rather than pretending they don't exist.
 
 ---
 
 ## Why generated, and why curated
 
-Semaphore's API is **127 operations, 38 of them destructive** (`DELETE`/`PUT`). It also ships **empty `operationId`s**, so a generic OpenAPI→MCP bridge produces unusable tool names.
+Semaphore's API is **127 operations** and ships **empty `operationId`s**, so a generic OpenAPI→MCP bridge produces unusable tool names.
 
-`generate.py` solves both: it reads the pinned `api-docs.yml`, filters to a hand-picked **allowlist**, synthesises clean tool names, and derives `readOnlyHint` / `destructiveHint` annotations from the HTTP verb. The result is **13 tools** — 11 read-only, 2 guarded writes, zero deletes.
+`generate.py` solves that: it reads the pinned `api-docs.yml`, filters to a hand-picked **allowlist**, synthesises clean tool names, and derives `readOnlyHint` / `destructiveHint` annotations from each tool's declared tier. The result is **23 tools across three tiers**:
+
+| Tier | Count | `readOnlyHint` | `destructiveHint` | Guard |
+|---|---|---|---|---|
+| **read** | 11 | `True` | `False` | safe to auto-allow |
+| **write** | 8 | `False` | `False` | `ask` — state-changing, non-destructive |
+| **delete** | 4 | `False` | `True` | `ask` **+** refuses unless `confirm=True` |
 
 ```
-GET  /projects                              -> list_projects       (readOnly)
-GET  /project/{id}/templates                -> list_templates      (readOnly)
-GET  /project/{id}/tasks                    -> list_tasks          (readOnly)
-GET  /project/{id}/tasks/{tid}              -> get_task            (readOnly)
-GET  /project/{id}/tasks/{tid}/output       -> get_task_output     (readOnly)
+GET    /project/{id}/templates              -> list_templates      (read)
+GET    /project/{id}/tasks/{tid}/output     -> get_task_output     (read)
 ...
-POST /project/{id}/tasks                    -> run_task            (write)
-POST /project/{id}/tasks/{tid}/stop         -> stop_task           (write)
+POST   /project/{id}/tasks                  -> run_task            (write)
+POST   /project/{id}/templates              -> create_template     (write)
+PUT    /project/{id}/environment/{eid}      -> update_environment  (write — set vars)
+POST   /project/{id}/inventory              -> create_inventory    (write)
+...
+DELETE /project/{id}/templates/{tid}        -> delete_template     (delete, guarded)
+DELETE /project/{id}/tasks/{tid}            -> delete_task         (delete, guarded)
 ```
 
-Widen or narrow the surface by editing the `ALLOWLIST` in `generate.py` and regenerating.
+Each `delete_*` tool **refuses on the first call** — it returns a refusal payload unless invoked with `confirm=True`, so a stray delete can never fire by accident. Widen or narrow the surface by editing the `ALLOWLIST` in `generate.py` and regenerating.
 
 ---
 
@@ -38,7 +46,7 @@ Pull the pre-built image from GitHub Container Registry:
 docker pull ghcr.io/gabrielbelli/semaphore-mcp:latest
 ```
 
-Mint a **scoped API token** in Semaphore (User settings → API Tokens) on an RBAC user with read + task-run permissions only. Then register with Claude Code by adding this to `~/.claude/mcp.json`:
+Mint a **scoped API token** in Semaphore (User settings → API Tokens) on an RBAC user scoped to match the tier you intend to allow — the token is the last, hardest fence. Then register with Claude Code by adding this to `~/.claude/mcp.json`:
 
 ```json
 {
@@ -67,11 +75,11 @@ Mint a **scoped API token** in Semaphore (User settings → API Tokens) on an RB
 | Layer | Enforced by | Real fence? |
 |---|---|---|
 | `destructiveHint` / `readOnlyHint` annotations | MCP client (advisory) | hint only |
-| Destructive tools not generated | `generate.py` allowlist | ✅ |
+| `confirm=True` gate on every `delete_*` | the server itself (in-process) | ✅ |
 | Claude Code `ask` / `deny` rules | Claude Code permissions | ✅ |
 | Scoped Semaphore API token | Semaphore RBAC (returns `403`) | ✅✅ |
 
-Belt-and-braces permission block for Claude Code `settings.json` — reads run silent, writes prompt every time:
+Belt-and-braces permission block for Claude Code `settings.json` — reads run silent, writes prompt, deletes are denied outright at the client (drop them into `ask` instead if you want to allow them):
 
 ```json
 {
@@ -84,7 +92,16 @@ Belt-and-braces permission block for Claude Code `settings.json` — reads run s
       "mcp__semaphore__list_inventory", "mcp__semaphore__get_inventory",
       "mcp__semaphore__list_environment"
     ],
-    "ask": ["mcp__semaphore__run_task", "mcp__semaphore__stop_task"]
+    "ask": [
+      "mcp__semaphore__run_task", "mcp__semaphore__stop_task",
+      "mcp__semaphore__create_template", "mcp__semaphore__update_template",
+      "mcp__semaphore__create_environment", "mcp__semaphore__update_environment",
+      "mcp__semaphore__create_inventory", "mcp__semaphore__update_inventory"
+    ],
+    "deny": [
+      "mcp__semaphore__delete_template", "mcp__semaphore__delete_environment",
+      "mcp__semaphore__delete_inventory", "mcp__semaphore__delete_task"
+    ]
   }
 }
 ```
