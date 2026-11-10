@@ -73,6 +73,8 @@ Mint a **scoped API token** in Semaphore (User settings → API Tokens) on an RB
 
 `-i` (not `-t`) is required for stdio MCP transport. Restart Claude Code, then call `list_projects()` to verify.
 
+Every request carries the User-Agent `semaphore-mcp/<version> (+https://github.com/gabrielbelli/semaphore-mcp)`. A WAF in front of Semaphore can redirect a generic HTTP library's User-Agent, such as `python-httpx/...`, to a challenge page. Each call then fails with `Redirect response '302 ...'`. If a WAF wants something else, set `SEMAPHORE_USER_AGENT` to replace the default.
+
 > **First publish:** GHCR images inherit the source repository's visibility *only after* the image is linked. The `org.opencontainers.image.source` label is set automatically by the workflow; on first publish, visit *Your profile → Packages → semaphore-mcp → Package settings* and either link it to the repo or flip visibility to public.
 
 ---
