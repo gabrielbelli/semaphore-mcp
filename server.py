@@ -12,8 +12,9 @@ you left out. (Environment secrets are write-only in the API, so they are never
 echoed back; omitting them leaves stored secrets untouched.)
 
 Env:
-  SEMAPHORE_URL    e.g. https://semaphore.example.com
-  SEMAPHORE_TOKEN  bearer API token (scope RBAC to match the tier you allow)
+  SEMAPHORE_URL         e.g. https://semaphore.example.com
+  SEMAPHORE_TOKEN       bearer API token (scope RBAC to match the tier you allow)
+  SEMAPHORE_USER_AGENT  optional; replaces the default semaphore-mcp/<version>
 """
 import os
 import sys
@@ -24,8 +25,16 @@ import httpx
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
+__version__ = "0.3.0"
+
 BASE = os.environ.get("SEMAPHORE_URL", "").rstrip("/")
 TOKEN = os.environ.get("SEMAPHORE_TOKEN", "")
+# The server names itself. A WAF in front of Semaphore can turn away the
+# User-Agent of a generic HTTP library (python-httpx, curl, python-requests)
+# with a redirect to a challenge page, and every call then fails. Keep "python"
+# and "httpx" out of it: that is what such rules match on.
+USER_AGENT = (os.environ.get("SEMAPHORE_USER_AGENT")
+              or f"semaphore-mcp/{__version__} (+https://github.com/gabrielbelli/semaphore-mcp)")
 
 mcp = FastMCP("semaphore")
 
@@ -34,7 +43,8 @@ async def _request(method, path, query=None, body=None):
     if not BASE or not TOKEN:
         return {"error": "SEMAPHORE_URL / SEMAPHORE_TOKEN not set"}
     url = BASE + "/api" + path
-    headers = {"Authorization": f"Bearer {TOKEN}", "Accept": "application/json"}
+    headers = {"Authorization": f"Bearer {TOKEN}", "Accept": "application/json",
+               "User-Agent": USER_AGENT}
     async with httpx.AsyncClient(timeout=30) as c:
         r = await c.request(method, url, headers=headers, params=query, json=body)
         r.raise_for_status()

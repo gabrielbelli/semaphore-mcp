@@ -176,3 +176,39 @@ def test_generation_is_reproducible(tools):
     # a second generate produces the identical surface
     subprocess.run([sys.executable, "generate.py"], cwd=ROOT, check=True)
     assert set(tools) == EXPECTED
+
+
+def test_requests_carry_the_servers_own_user_agent(server_mod, monkeypatch):
+    # A WAF in front of Semaphore redirected python-httpx's default User-Agent
+    # to a challenge page, and every tool failed. Each request names the server
+    # and its version, and nothing such a rule matches on.
+    captured = {}
+
+    class _C:
+        def __init__(self, *a, **k):
+            pass
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *a):
+            return False
+        async def request(self, method, url, headers=None, params=None, json=None):
+            captured["headers"] = headers
+            return _FakeResp(200, b"[]")
+
+    monkeypatch.setattr(server_mod, "BASE", "https://x")
+    monkeypatch.setattr(server_mod, "TOKEN", "t")
+    monkeypatch.setattr(server_mod.httpx, "AsyncClient", _C)
+    asyncio.run(server_mod.list_projects())
+    ua = captured["headers"]["User-Agent"]
+    assert ua.startswith(f"semaphore-mcp/{server_mod.__version__} ")
+    assert "python" not in ua.lower() and "httpx" not in ua.lower()
+
+
+def test_user_agent_can_be_replaced(monkeypatch):
+    # SEMAPHORE_USER_AGENT is read at import, so load a fresh copy with it set.
+    import importlib.util
+    monkeypatch.setenv("SEMAPHORE_USER_AGENT", "custom/1")
+    spec = importlib.util.spec_from_file_location("server_ua", ROOT / "server.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert mod.USER_AGENT == "custom/1"
