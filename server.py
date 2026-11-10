@@ -28,8 +28,10 @@ from mcp.types import ToolAnnotations
 
 __version__ = "0.3.0"
 
-BASE = os.environ.get("SEMAPHORE_URL", "").rstrip("/")
-TOKEN = os.environ.get("SEMAPHORE_TOKEN", "")
+# strip(): a CRLF env file, a secret file with a final newline or a "\n" in a
+# JSON config leaves a CR or LF on the value, and that is not a legal header.
+BASE = os.environ.get("SEMAPHORE_URL", "").strip().rstrip("/")
+TOKEN = os.environ.get("SEMAPHORE_TOKEN", "").strip()
 # The server names itself. A WAF in front of Semaphore can turn away the
 # User-Agent of a generic HTTP library (python-httpx, curl, python-requests)
 # with a redirect to a challenge page, and every call then fails. Keep "python"
@@ -41,6 +43,17 @@ USER_AGENT = (os.environ.get("SEMAPHORE_USER_AGENT")
 mcp = MCPServer("semaphore", version=__version__)
 
 
+def _redact(text):
+    # An error text goes to the model, and the token must not. When h11 refuses
+    # the Authorization header (a token with a control character in it), its
+    # error quotes the header as a bytes literal, so the token shows up escaped
+    # and not as it is. Hide both spellings.
+    for secret in (TOKEN, repr(TOKEN)[1:-1]):
+        if secret:
+            text = text.replace(secret, "***")
+    return text
+
+
 async def _request(method, path, query=None, body=None):
     if not BASE or not TOKEN:
         return {"error": "SEMAPHORE_URL / SEMAPHORE_TOKEN not set"}
@@ -50,7 +63,8 @@ async def _request(method, path, query=None, body=None):
     # mcp 2 hides the text of an unexpected exception and returns only "Error
     # executing tool <name>". A WAF's 302, an RBAC 403 or a refused connection
     # is a failure we expect, so raise it as a ToolError and the client reads
-    # the cause, as it did under mcp 1.
+    # the cause, as it did under mcp 1. "from None" keeps the original
+    # exception, whose text can hold the token, out of any traceback.
     try:
         async with httpx.AsyncClient(timeout=30) as c:
             r = await c.request(method, url, headers=headers, params=query, json=body)
@@ -62,7 +76,7 @@ async def _request(method, path, query=None, body=None):
             ct = r.headers.get("content-type", "")
             return r.json() if "json" in ct else r.text
     except (httpx.HTTPError, json.JSONDecodeError) as exc:
-        raise ToolError(str(exc) or type(exc).__name__) from exc
+        raise ToolError(_redact(str(exc)) or type(exc).__name__) from None
 
 
 @mcp.tool(annotations=ToolAnnotations(title='list_projects', read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=False))
