@@ -63,21 +63,21 @@ def test_exact_curated_surface(tools):
 
 def test_read_tools_are_readonly(tools):
     for name in READ_TOOLS:
-        assert tools[name].annotations.readOnlyHint is True, f"{name} must be readOnly"
+        assert tools[name].annotations.read_only_hint is True, f"{name} must be readOnly"
 
 
 def test_write_tools_are_not_readonly_nor_destructive(tools):
     for name in WRITE_TOOLS:
         a = tools[name].annotations
-        assert a.readOnlyHint is False, f"{name} must not be readOnly"
-        assert a.destructiveHint is False, f"{name} must not be destructive"
+        assert a.read_only_hint is False, f"{name} must not be readOnly"
+        assert a.destructive_hint is False, f"{name} must not be destructive"
 
 
 def test_delete_tools_are_flagged_destructive(tools):
     for name in DELETE_TOOLS:
         a = tools[name].annotations
-        assert a.readOnlyHint is False, f"{name} must not be readOnly"
-        assert a.destructiveHint is True, f"{name} must be destructive"
+        assert a.read_only_hint is False, f"{name} must not be readOnly"
+        assert a.destructive_hint is True, f"{name} must be destructive"
 
 
 def test_delete_refuses_without_confirmation(server_mod):
@@ -94,7 +94,7 @@ def test_update_tools_require_only_ids(tools):
     # read-modify-write: a rename must be possible without re-supplying every
     # field, so the ONLY required params are the path ids (project_id + resource).
     for name in UPDATE_TOOLS:
-        required = set(tools[name].inputSchema.get("required", []))
+        required = set(tools[name].input_schema.get("required", []))
         assert required <= {"project_id", "template_id", "environment_id",
                             "inventory_id", "repository_id"}, \
             f"{name} should not force non-id fields (would blank on rename): {required}"
@@ -136,6 +136,34 @@ def test_204_empty_body_is_success_not_error(server_mod, monkeypatch):
     out = asyncio.run(server_mod.delete_task(1, 1, confirm=True))
     assert '"ok": true' in out
     assert "error" not in out
+
+
+def test_upstream_http_error_reaches_the_client(server_mod, monkeypatch):
+    # mcp 2 replaces an unexpected exception's text with a bare "Error executing
+    # tool <name>". A WAF's redirect or an RBAC 403 must still tell the client
+    # what went wrong, so call the tool as a client does, not the bare function.
+    from mcp import Client
+
+    httpx = server_mod.httpx
+    real = httpx.AsyncClient
+
+    def _redirect(request):
+        return httpx.Response(302, headers={"location": "https://x/challenge"}, request=request)
+
+    monkeypatch.setattr(server_mod, "BASE", "https://x")
+    monkeypatch.setattr(server_mod, "TOKEN", "t")
+    monkeypatch.setattr(httpx, "AsyncClient",
+                        lambda **k: real(transport=httpx.MockTransport(_redirect), **k))
+
+    async def _call():
+        async with Client(server_mod.mcp) as c:
+            return await c.call_tool("list_projects", {})
+
+    res = asyncio.run(_call())
+    assert res.is_error is True
+    text = res.content[0].text
+    assert text.startswith("Error executing tool list_projects: ")
+    assert "Redirect response '302 Found'" in text
 
 
 def test_update_preserves_unspecified_fields(server_mod, monkeypatch):

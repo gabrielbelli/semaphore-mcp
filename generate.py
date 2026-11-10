@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate a curated FastMCP server from Semaphore's OpenAPI (Swagger 2.0) spec.
+"""Generate a curated MCPServer (mcp 2.x) from Semaphore's OpenAPI (Swagger 2.0) spec.
 
 Why a generator and not a generic bridge:
   * Semaphore's spec ships EMPTY operationIds -> a naive bridge emits unusable
@@ -159,7 +159,8 @@ import json
 import asyncio
 from typing import Optional
 import httpx
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
 __version__ = "0.3.0"
@@ -173,7 +174,8 @@ TOKEN = os.environ.get("SEMAPHORE_TOKEN", "")
 USER_AGENT = (os.environ.get("SEMAPHORE_USER_AGENT")
               or f"semaphore-mcp/{__version__} (+https://github.com/gabrielbelli/semaphore-mcp)")
 
-mcp = FastMCP("semaphore")
+# version= is what clients see as serverInfo.version; mcp 2 sends "" without it.
+mcp = MCPServer("semaphore", version=__version__)
 
 
 async def _request(method, path, query=None, body=None):
@@ -182,15 +184,22 @@ async def _request(method, path, query=None, body=None):
     url = BASE + "/api" + path
     headers = {"Authorization": f"Bearer {TOKEN}", "Accept": "application/json",
                "User-Agent": USER_AGENT}
-    async with httpx.AsyncClient(timeout=30) as c:
-        r = await c.request(method, url, headers=headers, params=query, json=body)
-        r.raise_for_status()
-        # Semaphore answers PUT/DELETE with 204 No Content (empty body). Parsing
-        # that as JSON blows up ("Expecting value"), so report the success it is.
-        if r.status_code == 204 or not r.content:
-            return {"ok": True}
-        ct = r.headers.get("content-type", "")
-        return r.json() if "json" in ct else r.text
+    # mcp 2 hides the text of an unexpected exception and returns only "Error
+    # executing tool <name>". A WAF's 302, an RBAC 403 or a refused connection
+    # is a failure we expect, so raise it as a ToolError and the client reads
+    # the cause, as it did under mcp 1.
+    try:
+        async with httpx.AsyncClient(timeout=30) as c:
+            r = await c.request(method, url, headers=headers, params=query, json=body)
+            r.raise_for_status()
+            # Semaphore answers PUT/DELETE with 204 No Content (empty body). Parsing
+            # that as JSON blows up ("Expecting value"), so report the success it is.
+            if r.status_code == 204 or not r.content:
+                return {"ok": True}
+            ct = r.headers.get("content-type", "")
+            return r.json() if "json" in ct else r.text
+    except (httpx.HTTPError, json.JSONDecodeError) as exc:
+        raise ToolError(str(exc) or type(exc).__name__) from exc
 '''
 
 
@@ -206,8 +215,8 @@ def emit_tool(entry):
     read_only = kind == "read"
     destructive = kind == "delete"
     idempotent = kind in ("read", "delete")
-    ann = (f'ToolAnnotations(title={name!r}, readOnlyHint={read_only}, '
-           f'destructiveHint={destructive}, idempotentHint={idempotent}, openWorldHint=False)')
+    ann = (f'ToolAnnotations(title={name!r}, read_only_hint={read_only}, '
+           f'destructive_hint={destructive}, idempotent_hint={idempotent}, open_world_hint=False)')
 
     # --- signature: path params (required ints), then body fields, then extras
     args = [f"{p}: int" for p in pp]
@@ -297,8 +306,8 @@ def _list():
     tools = asyncio.run(mcp.list_tools())
     for t in tools:
         a = t.annotations
-        ro = getattr(a, "readOnlyHint", None) if a else None
-        de = getattr(a, "destructiveHint", None) if a else None
+        ro = a.read_only_hint if a else None
+        de = a.destructive_hint if a else None
         print(f"{{t.name:20}} readOnly={{ro}} destructive={{de}}  {{t.description}}")
     print(f"\\n{{len(tools)}} tools exposed "
           "({tiers['read']} read / {tiers['write']} write / {tiers['delete']} delete-guarded)")

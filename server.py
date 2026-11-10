@@ -22,7 +22,8 @@ import json
 import asyncio
 from typing import Optional
 import httpx
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
 __version__ = "0.3.0"
@@ -36,7 +37,8 @@ TOKEN = os.environ.get("SEMAPHORE_TOKEN", "")
 USER_AGENT = (os.environ.get("SEMAPHORE_USER_AGENT")
               or f"semaphore-mcp/{__version__} (+https://github.com/gabrielbelli/semaphore-mcp)")
 
-mcp = FastMCP("semaphore")
+# version= is what clients see as serverInfo.version; mcp 2 sends "" without it.
+mcp = MCPServer("semaphore", version=__version__)
 
 
 async def _request(method, path, query=None, body=None):
@@ -45,90 +47,97 @@ async def _request(method, path, query=None, body=None):
     url = BASE + "/api" + path
     headers = {"Authorization": f"Bearer {TOKEN}", "Accept": "application/json",
                "User-Agent": USER_AGENT}
-    async with httpx.AsyncClient(timeout=30) as c:
-        r = await c.request(method, url, headers=headers, params=query, json=body)
-        r.raise_for_status()
-        # Semaphore answers PUT/DELETE with 204 No Content (empty body). Parsing
-        # that as JSON blows up ("Expecting value"), so report the success it is.
-        if r.status_code == 204 or not r.content:
-            return {"ok": True}
-        ct = r.headers.get("content-type", "")
-        return r.json() if "json" in ct else r.text
+    # mcp 2 hides the text of an unexpected exception and returns only "Error
+    # executing tool <name>". A WAF's 302, an RBAC 403 or a refused connection
+    # is a failure we expect, so raise it as a ToolError and the client reads
+    # the cause, as it did under mcp 1.
+    try:
+        async with httpx.AsyncClient(timeout=30) as c:
+            r = await c.request(method, url, headers=headers, params=query, json=body)
+            r.raise_for_status()
+            # Semaphore answers PUT/DELETE with 204 No Content (empty body). Parsing
+            # that as JSON blows up ("Expecting value"), so report the success it is.
+            if r.status_code == 204 or not r.content:
+                return {"ok": True}
+            ct = r.headers.get("content-type", "")
+            return r.json() if "json" in ct else r.text
+    except (httpx.HTTPError, json.JSONDecodeError) as exc:
+        raise ToolError(str(exc) or type(exc).__name__) from exc
 
 
-@mcp.tool(annotations=ToolAnnotations(title='list_projects', readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False))
+@mcp.tool(annotations=ToolAnnotations(title='list_projects', read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=False))
 async def list_projects(sort: str = "name", order: str = "asc") -> str:
     """GET /projects"""
     res = await _request("GET", f"/projects", query={"sort": sort, "order": order}, body=None)
     return json.dumps(res, indent=2, default=str)
 
-@mcp.tool(annotations=ToolAnnotations(title='get_project', readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False))
+@mcp.tool(annotations=ToolAnnotations(title='get_project', read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=False))
 async def get_project(project_id: int) -> str:
     """GET /project/{project_id}/"""
     res = await _request("GET", f"/project/{project_id}/", query=None, body=None)
     return json.dumps(res, indent=2, default=str)
 
-@mcp.tool(annotations=ToolAnnotations(title='list_templates', readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False))
+@mcp.tool(annotations=ToolAnnotations(title='list_templates', read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=False))
 async def list_templates(project_id: int, sort: str = "name", order: str = "asc") -> str:
     """GET /project/{project_id}/templates"""
     res = await _request("GET", f"/project/{project_id}/templates", query={"sort": sort, "order": order}, body=None)
     return json.dumps(res, indent=2, default=str)
 
-@mcp.tool(annotations=ToolAnnotations(title='get_template', readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False))
+@mcp.tool(annotations=ToolAnnotations(title='get_template', read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=False))
 async def get_template(project_id: int, template_id: int) -> str:
     """GET /project/{project_id}/templates/{template_id}"""
     res = await _request("GET", f"/project/{project_id}/templates/{template_id}", query=None, body=None)
     return json.dumps(res, indent=2, default=str)
 
-@mcp.tool(annotations=ToolAnnotations(title='list_tasks', readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False))
+@mcp.tool(annotations=ToolAnnotations(title='list_tasks', read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=False))
 async def list_tasks(project_id: int, sort: str = "name", order: str = "asc") -> str:
     """GET /project/{project_id}/tasks"""
     res = await _request("GET", f"/project/{project_id}/tasks", query={"sort": sort, "order": order}, body=None)
     return json.dumps(res, indent=2, default=str)
 
-@mcp.tool(annotations=ToolAnnotations(title='get_last_tasks', readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False))
+@mcp.tool(annotations=ToolAnnotations(title='get_last_tasks', read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=False))
 async def get_last_tasks(project_id: int) -> str:
     """GET /project/{project_id}/tasks/last"""
     res = await _request("GET", f"/project/{project_id}/tasks/last", query=None, body=None)
     return json.dumps(res, indent=2, default=str)
 
-@mcp.tool(annotations=ToolAnnotations(title='get_task', readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False))
+@mcp.tool(annotations=ToolAnnotations(title='get_task', read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=False))
 async def get_task(project_id: int, task_id: int) -> str:
     """GET /project/{project_id}/tasks/{task_id}"""
     res = await _request("GET", f"/project/{project_id}/tasks/{task_id}", query=None, body=None)
     return json.dumps(res, indent=2, default=str)
 
-@mcp.tool(annotations=ToolAnnotations(title='get_task_output', readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False))
+@mcp.tool(annotations=ToolAnnotations(title='get_task_output', read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=False))
 async def get_task_output(project_id: int, task_id: int) -> str:
     """GET /project/{project_id}/tasks/{task_id}/output"""
     res = await _request("GET", f"/project/{project_id}/tasks/{task_id}/output", query=None, body=None)
     return json.dumps(res, indent=2, default=str)
 
-@mcp.tool(annotations=ToolAnnotations(title='list_inventory', readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False))
+@mcp.tool(annotations=ToolAnnotations(title='list_inventory', read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=False))
 async def list_inventory(project_id: int, sort: str = "name", order: str = "asc") -> str:
     """GET /project/{project_id}/inventory"""
     res = await _request("GET", f"/project/{project_id}/inventory", query={"sort": sort, "order": order}, body=None)
     return json.dumps(res, indent=2, default=str)
 
-@mcp.tool(annotations=ToolAnnotations(title='get_inventory', readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False))
+@mcp.tool(annotations=ToolAnnotations(title='get_inventory', read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=False))
 async def get_inventory(project_id: int, inventory_id: int) -> str:
     """GET /project/{project_id}/inventory/{inventory_id}"""
     res = await _request("GET", f"/project/{project_id}/inventory/{inventory_id}", query=None, body=None)
     return json.dumps(res, indent=2, default=str)
 
-@mcp.tool(annotations=ToolAnnotations(title='list_environment', readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False))
+@mcp.tool(annotations=ToolAnnotations(title='list_environment', read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=False))
 async def list_environment(project_id: int, sort: str = "name", order: str = "asc") -> str:
     """GET /project/{project_id}/environment"""
     res = await _request("GET", f"/project/{project_id}/environment", query={"sort": sort, "order": order}, body=None)
     return json.dumps(res, indent=2, default=str)
 
-@mcp.tool(annotations=ToolAnnotations(title='list_repositories', readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False))
+@mcp.tool(annotations=ToolAnnotations(title='list_repositories', read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=False))
 async def list_repositories(project_id: int, sort: str = "name", order: str = "asc") -> str:
     """GET /project/{project_id}/repositories"""
     res = await _request("GET", f"/project/{project_id}/repositories", query={"sort": sort, "order": order}, body=None)
     return json.dumps(res, indent=2, default=str)
 
-@mcp.tool(annotations=ToolAnnotations(title='run_task', readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
+@mcp.tool(annotations=ToolAnnotations(title='run_task', read_only_hint=False, destructive_hint=False, idempotent_hint=False, open_world_hint=False))
 async def run_task(project_id: int, template_id: int, environment: str = "", limit: str = "") -> str:
     """POST /project/{project_id}/tasks"""
     body = {"project_id": project_id, "template_id": template_id, "environment": environment, "limit": limit}
@@ -136,7 +145,7 @@ async def run_task(project_id: int, template_id: int, environment: str = "", lim
     res = await _request("POST", f"/project/{project_id}/tasks", query=None, body=body)
     return json.dumps(res, indent=2, default=str)
 
-@mcp.tool(annotations=ToolAnnotations(title='stop_task', readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
+@mcp.tool(annotations=ToolAnnotations(title='stop_task', read_only_hint=False, destructive_hint=False, idempotent_hint=False, open_world_hint=False))
 async def stop_task(project_id: int, task_id: int) -> str:
     """POST /project/{project_id}/tasks/{task_id}/stop"""
     body = {"project_id": project_id, "id": task_id}
@@ -144,7 +153,7 @@ async def stop_task(project_id: int, task_id: int) -> str:
     res = await _request("POST", f"/project/{project_id}/tasks/{task_id}/stop", query=None, body=body)
     return json.dumps(res, indent=2, default=str)
 
-@mcp.tool(annotations=ToolAnnotations(title='create_template', readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
+@mcp.tool(annotations=ToolAnnotations(title='create_template', read_only_hint=False, destructive_hint=False, idempotent_hint=False, open_world_hint=False))
 async def create_template(project_id: int, name: str, playbook: str, inventory_id: int, repository_id: int, environment_id: int, app: str = "ansible", git_branch: Optional[str] = None, description: Optional[str] = None) -> str:
     """POST /project/{project_id}/templates"""
     body = {"project_id": project_id, "name": name, "playbook": playbook, "inventory_id": inventory_id, "repository_id": repository_id, "environment_id": environment_id, "app": app, "git_branch": git_branch, "description": description}
@@ -152,7 +161,7 @@ async def create_template(project_id: int, name: str, playbook: str, inventory_i
     res = await _request("POST", f"/project/{project_id}/templates", query=None, body=body)
     return json.dumps(res, indent=2, default=str)
 
-@mcp.tool(annotations=ToolAnnotations(title='update_template', readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
+@mcp.tool(annotations=ToolAnnotations(title='update_template', read_only_hint=False, destructive_hint=False, idempotent_hint=False, open_world_hint=False))
 async def update_template(project_id: int, template_id: int, name: Optional[str] = None, playbook: Optional[str] = None, inventory_id: Optional[int] = None, repository_id: Optional[int] = None, environment_id: Optional[int] = None, app: Optional[str] = None, git_branch: Optional[str] = None, description: Optional[str] = None, arguments: Optional[str] = None, allow_override_args_in_task: Optional[bool] = None) -> str:
     """PUT /project/{project_id}/templates/{template_id}"""
     current = await _request("GET", f"/project/{project_id}/templates/{template_id}", query=None, body=None)
@@ -165,7 +174,7 @@ async def update_template(project_id: int, template_id: int, name: Optional[str]
     res = await _request("PUT", f"/project/{project_id}/templates/{template_id}", query=None, body=body)
     return json.dumps(res, indent=2, default=str)
 
-@mcp.tool(annotations=ToolAnnotations(title='create_environment', readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
+@mcp.tool(annotations=ToolAnnotations(title='create_environment', read_only_hint=False, destructive_hint=False, idempotent_hint=False, open_world_hint=False))
 async def create_environment(project_id: int, name: str, json_vars: str = "{}", env_vars: str = "{}", password: Optional[str] = None) -> str:
     """POST /project/{project_id}/environment"""
     body = {"project_id": project_id, "name": name, "json": json_vars, "env": env_vars, "password": password}
@@ -173,7 +182,7 @@ async def create_environment(project_id: int, name: str, json_vars: str = "{}", 
     res = await _request("POST", f"/project/{project_id}/environment", query=None, body=body)
     return json.dumps(res, indent=2, default=str)
 
-@mcp.tool(annotations=ToolAnnotations(title='update_environment', readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
+@mcp.tool(annotations=ToolAnnotations(title='update_environment', read_only_hint=False, destructive_hint=False, idempotent_hint=False, open_world_hint=False))
 async def update_environment(project_id: int, environment_id: int, name: Optional[str] = None, json_vars: Optional[str] = None, env_vars: Optional[str] = None, password: Optional[str] = None) -> str:
     """PUT /project/{project_id}/environment/{environment_id}"""
     current = await _request("GET", f"/project/{project_id}/environment/{environment_id}", query=None, body=None)
@@ -187,7 +196,7 @@ async def update_environment(project_id: int, environment_id: int, name: Optiona
     res = await _request("PUT", f"/project/{project_id}/environment/{environment_id}", query=None, body=body)
     return json.dumps(res, indent=2, default=str)
 
-@mcp.tool(annotations=ToolAnnotations(title='create_inventory', readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
+@mcp.tool(annotations=ToolAnnotations(title='create_inventory', read_only_hint=False, destructive_hint=False, idempotent_hint=False, open_world_hint=False))
 async def create_inventory(project_id: int, name: str, inventory: str, type: str = "static", ssh_key_id: Optional[int] = None, become_key_id: Optional[int] = None, repository_id: Optional[int] = None) -> str:
     """POST /project/{project_id}/inventory"""
     body = {"project_id": project_id, "name": name, "inventory": inventory, "type": type, "ssh_key_id": ssh_key_id, "become_key_id": become_key_id, "repository_id": repository_id}
@@ -195,7 +204,7 @@ async def create_inventory(project_id: int, name: str, inventory: str, type: str
     res = await _request("POST", f"/project/{project_id}/inventory", query=None, body=body)
     return json.dumps(res, indent=2, default=str)
 
-@mcp.tool(annotations=ToolAnnotations(title='update_inventory', readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
+@mcp.tool(annotations=ToolAnnotations(title='update_inventory', read_only_hint=False, destructive_hint=False, idempotent_hint=False, open_world_hint=False))
 async def update_inventory(project_id: int, inventory_id: int, name: Optional[str] = None, inventory: Optional[str] = None, type: Optional[str] = None, ssh_key_id: Optional[int] = None, become_key_id: Optional[int] = None, repository_id: Optional[int] = None) -> str:
     """PUT /project/{project_id}/inventory/{inventory_id}"""
     current = await _request("GET", f"/project/{project_id}/inventory/{inventory_id}", query=None, body=None)
@@ -208,7 +217,7 @@ async def update_inventory(project_id: int, inventory_id: int, name: Optional[st
     res = await _request("PUT", f"/project/{project_id}/inventory/{inventory_id}", query=None, body=body)
     return json.dumps(res, indent=2, default=str)
 
-@mcp.tool(annotations=ToolAnnotations(title='create_repository', readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
+@mcp.tool(annotations=ToolAnnotations(title='create_repository', read_only_hint=False, destructive_hint=False, idempotent_hint=False, open_world_hint=False))
 async def create_repository(project_id: int, name: str, git_url: str, ssh_key_id: int, git_branch: str = "main") -> str:
     """POST /project/{project_id}/repositories"""
     body = {"project_id": project_id, "name": name, "git_url": git_url, "ssh_key_id": ssh_key_id, "git_branch": git_branch}
@@ -216,7 +225,7 @@ async def create_repository(project_id: int, name: str, git_url: str, ssh_key_id
     res = await _request("POST", f"/project/{project_id}/repositories", query=None, body=body)
     return json.dumps(res, indent=2, default=str)
 
-@mcp.tool(annotations=ToolAnnotations(title='update_repository', readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
+@mcp.tool(annotations=ToolAnnotations(title='update_repository', read_only_hint=False, destructive_hint=False, idempotent_hint=False, open_world_hint=False))
 async def update_repository(project_id: int, repository_id: int, name: Optional[str] = None, git_url: Optional[str] = None, git_branch: Optional[str] = None, ssh_key_id: Optional[int] = None) -> str:
     """PUT /project/{project_id}/repositories/{repository_id}"""
     current = await _request("GET", f"/project/{project_id}/repositories/{repository_id}", query=None, body=None)
@@ -229,7 +238,7 @@ async def update_repository(project_id: int, repository_id: int, name: Optional[
     res = await _request("PUT", f"/project/{project_id}/repositories/{repository_id}", query=None, body=body)
     return json.dumps(res, indent=2, default=str)
 
-@mcp.tool(annotations=ToolAnnotations(title='delete_template', readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=False))
+@mcp.tool(annotations=ToolAnnotations(title='delete_template', read_only_hint=False, destructive_hint=True, idempotent_hint=True, open_world_hint=False))
 async def delete_template(project_id: int, template_id: int, confirm: bool = False) -> str:
     """DELETE /project/{project_id}/templates/{template_id}"""
     if not confirm:
@@ -237,7 +246,7 @@ async def delete_template(project_id: int, template_id: int, confirm: bool = Fal
     res = await _request("DELETE", f"/project/{project_id}/templates/{template_id}", query=None, body=None)
     return json.dumps(res, indent=2, default=str)
 
-@mcp.tool(annotations=ToolAnnotations(title='delete_environment', readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=False))
+@mcp.tool(annotations=ToolAnnotations(title='delete_environment', read_only_hint=False, destructive_hint=True, idempotent_hint=True, open_world_hint=False))
 async def delete_environment(project_id: int, environment_id: int, confirm: bool = False) -> str:
     """DELETE /project/{project_id}/environment/{environment_id}"""
     if not confirm:
@@ -245,7 +254,7 @@ async def delete_environment(project_id: int, environment_id: int, confirm: bool
     res = await _request("DELETE", f"/project/{project_id}/environment/{environment_id}", query=None, body=None)
     return json.dumps(res, indent=2, default=str)
 
-@mcp.tool(annotations=ToolAnnotations(title='delete_inventory', readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=False))
+@mcp.tool(annotations=ToolAnnotations(title='delete_inventory', read_only_hint=False, destructive_hint=True, idempotent_hint=True, open_world_hint=False))
 async def delete_inventory(project_id: int, inventory_id: int, confirm: bool = False) -> str:
     """DELETE /project/{project_id}/inventory/{inventory_id}"""
     if not confirm:
@@ -253,7 +262,7 @@ async def delete_inventory(project_id: int, inventory_id: int, confirm: bool = F
     res = await _request("DELETE", f"/project/{project_id}/inventory/{inventory_id}", query=None, body=None)
     return json.dumps(res, indent=2, default=str)
 
-@mcp.tool(annotations=ToolAnnotations(title='delete_repository', readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=False))
+@mcp.tool(annotations=ToolAnnotations(title='delete_repository', read_only_hint=False, destructive_hint=True, idempotent_hint=True, open_world_hint=False))
 async def delete_repository(project_id: int, repository_id: int, confirm: bool = False) -> str:
     """DELETE /project/{project_id}/repositories/{repository_id}"""
     if not confirm:
@@ -261,7 +270,7 @@ async def delete_repository(project_id: int, repository_id: int, confirm: bool =
     res = await _request("DELETE", f"/project/{project_id}/repositories/{repository_id}", query=None, body=None)
     return json.dumps(res, indent=2, default=str)
 
-@mcp.tool(annotations=ToolAnnotations(title='delete_task', readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=False))
+@mcp.tool(annotations=ToolAnnotations(title='delete_task', read_only_hint=False, destructive_hint=True, idempotent_hint=True, open_world_hint=False))
 async def delete_task(project_id: int, task_id: int, confirm: bool = False) -> str:
     """DELETE /project/{project_id}/tasks/{task_id}"""
     if not confirm:
@@ -274,8 +283,8 @@ def _list():
     tools = asyncio.run(mcp.list_tools())
     for t in tools:
         a = t.annotations
-        ro = getattr(a, "readOnlyHint", None) if a else None
-        de = getattr(a, "destructiveHint", None) if a else None
+        ro = a.read_only_hint if a else None
+        de = a.destructive_hint if a else None
         print(f"{t.name:20} readOnly={ro} destructive={de}  {t.description}")
     print(f"\n{len(tools)} tools exposed "
           "(12 read / 10 write / 5 delete-guarded)")
