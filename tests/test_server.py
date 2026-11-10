@@ -5,7 +5,8 @@ These guard the safety model, not the live API:
   * only curated tools are exposed (three tiers: read / write / delete)
   * read tools carry readOnlyHint=True; writes do not
   * delete tools carry destructiveHint=True AND refuse without confirm=True
-No network access — tools return a graceful error when env is unset.
+No network access: the tests clear SEMAPHORE_* from the environment, so a tool
+returns a graceful error and never calls the Semaphore the shell points at.
 """
 import asyncio
 import subprocess
@@ -36,6 +37,17 @@ DELETE_TOOLS = {
     "delete_repository", "delete_task",
 }
 EXPECTED = READ_TOOLS | WRITE_TOOLS | DELETE_TOOLS
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _no_real_semaphore():
+    # server.py reads SEMAPHORE_URL and SEMAPHORE_TOKEN at import. With them
+    # exported in the shell, a delete_task(confirm=True) below sent a real
+    # DELETE to that Semaphore. Clear them before anything imports the server.
+    with pytest.MonkeyPatch.context() as mp:
+        for var in ("SEMAPHORE_URL", "SEMAPHORE_TOKEN", "SEMAPHORE_USER_AGENT"):
+            mp.delenv(var, raising=False)
+        yield
 
 
 @pytest.fixture(scope="module")
@@ -80,14 +92,18 @@ def test_delete_tools_are_flagged_destructive(tools):
         assert a.destructive_hint is True, f"{name} must be destructive"
 
 
-def test_delete_refuses_without_confirmation(server_mod):
+def test_delete_refuses_without_confirmation(server_mod, monkeypatch):
     # the in-server guard: a delete with confirm defaulting False must NOT
     # reach the network — it returns the refusal payload instead.
+    monkeypatch.setattr(server_mod, "BASE", "")
+    monkeypatch.setattr(server_mod, "TOKEN", "")
     out = asyncio.run(server_mod.delete_task(project_id=1, task_id=1))
     assert "destructive operation refused" in out
-    # and confirm=True gets past the guard (fails later on unset env, not the gate)
+    # and confirm=True gets past the guard, then stops on the unset env, not
+    # on the gate and not at a real Semaphore
     out2 = asyncio.run(server_mod.delete_task(project_id=1, task_id=1, confirm=True))
     assert "destructive operation refused" not in out2
+    assert "SEMAPHORE_URL / SEMAPHORE_TOKEN not set" in out2
 
 
 def test_update_tools_require_only_ids(tools):
@@ -151,7 +167,8 @@ def test_upstream_http_error_reaches_the_client(server_mod, monkeypatch):
         return httpx.Response(302, headers={"location": "https://x/challenge"}, request=request)
 
     monkeypatch.setattr(server_mod, "BASE", "https://x")
-    monkeypatch.setattr(server_mod, "TOKEN", "t")
+    # long enough that redacting it cannot eat letters of the error text
+    monkeypatch.setattr(server_mod, "TOKEN", "dummy-token")
     monkeypatch.setattr(httpx, "AsyncClient",
                         lambda **k: real(transport=httpx.MockTransport(_redirect), **k))
 
@@ -232,11 +249,62 @@ def test_requests_carry_the_servers_own_user_agent(server_mod, monkeypatch):
     assert "python" not in ua.lower() and "httpx" not in ua.lower()
 
 
-def test_user_agent_can_be_replaced(monkeypatch):
-    # SEMAPHORE_USER_AGENT is read at import, so load a fresh copy with it set.
+def _fresh_server(monkeypatch, **env):
+    # server.py reads its env at import, so load a fresh copy with env set.
     import importlib.util
-    monkeypatch.setenv("SEMAPHORE_USER_AGENT", "custom/1")
-    spec = importlib.util.spec_from_file_location("server_ua", ROOT / "server.py")
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    spec = importlib.util.spec_from_file_location("server_fresh", ROOT / "server.py")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
+    return mod
+
+
+def test_user_agent_can_be_replaced(server_mod, monkeypatch):
+    mod = _fresh_server(monkeypatch, SEMAPHORE_USER_AGENT="custom/1")
     assert mod.USER_AGENT == "custom/1"
+
+
+@pytest.mark.parametrize("token, stripped", [
+    ("dummy-token-value\r", True),    # CRLF env file
+    ("dummy-token-value\n", True),    # secret file with a final newline
+    ("dummy-token\nvalue", False),    # a newline that strip() cannot remove
+])
+def test_token_never_reaches_the_client(server_mod, monkeypatch, token, stripped):
+    # h11 refuses a header with a CR or LF in it, and its error quotes the
+    # header: "Illegal header value b'Bearer <token>'". As a ToolError, that
+    # text went to the model, token and all.
+    import h11
+    from mcp import Client
+
+    httpx = server_mod.httpx
+    real = httpx.AsyncClient
+
+    def _h11_checks_headers(request):
+        # the check httpx's real transport runs before it sends, without a socket
+        try:
+            h11.Request(method=request.method, target=request.url.raw_path,
+                        headers=list(request.headers.raw))
+        except h11.LocalProtocolError as exc:
+            raise httpx.LocalProtocolError(str(exc), request=request) from exc
+        return httpx.Response(200, json=[], request=request)
+
+    mod = _fresh_server(monkeypatch, SEMAPHORE_URL="https://x", SEMAPHORE_TOKEN=token)
+    monkeypatch.setattr(httpx, "AsyncClient",
+                        lambda **k: real(transport=httpx.MockTransport(_h11_checks_headers), **k))
+
+    async def _call():
+        async with Client(mod.mcp) as c:
+            return await c.call_tool("list_projects", {})
+
+    res = asyncio.run(_call())
+    text = res.content[0].text
+    assert "dummy-token" not in text
+    if stripped:
+        # a trailing CR or LF is gone at load, so the call goes through
+        assert res.is_error is False and text == "[]"
+    else:
+        # still refused, and the error still says why
+        assert res.is_error is True
+        assert text == ("Error executing tool list_projects: "
+                        "Illegal header value b'Bearer ***'")
